@@ -1,0 +1,127 @@
+:root {
+  --bg: #0f172a;
+  --panel: #1e293b;
+  --panel-2: #273449;
+  --border: #334155;
+  --text: #e2e8f0;
+  --muted: #94a3b8;
+  --accent: #38bdf8;
+  --accent-2: #0ea5e9;
+  --danger: #f87171;
+  --ok: #34d399;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: 'Inter', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+
+a { color: var(--accent); text-decoration: none; }
+
+.layout { display: flex; min-height: 100vh; }
+
+.sidebar {
+  width: 210px;
+  background: var(--panel);
+  border-right: 1px solid var(--border);
+  padding: 20px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.sidebar .brand {
+  font-size: 18px; font-weight: 700; margin-bottom: 18px;
+  display: flex; align-items: center; gap: 8px;
+}
+.sidebar a {
+  color: var(--muted); padding: 9px 12px; border-radius: 8px; font-size: 14px;
+}
+.sidebar a.router-link-active { background: var(--panel-2); color: var(--text); }
+.sidebar .spacer { flex: 1; }
+.sidebar .user { font-size: 12px; color: var(--muted); padding: 8px 12px; }
+.sidebar button {
+  margin: 0 6px; background: transparent; border: 1px solid var(--border);
+  color: var(--muted); border-radius: 6px; padding: 5px 10px; cursor: pointer;
+}
+
+.content { flex: 1; padding: 26px 30px; overflow: auto; }
+
+.card {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 12px; padding: 20px;
+}
+
+h1 { font-size: 20px; margin: 0 0 18px; }
+h2 { font-size: 15px; margin: 0 0 12px; color: var(--muted); }
+
+table { width: 100%; border-collapse: collapse; font-size: 14px; }
+th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border); }
+th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; }
+
+button.btn, a.btn {
+  display: inline-block;
+  background: var(--accent-2); color: #04222f; border: none; border-radius: 8px;
+  padding: 8px 14px; font-size: 13px; font-weight: 600; cursor: pointer;
+  text-decoration: none; line-height: 1;
+}
+button.btn.ghost, a.btn.ghost { background: transparent; color: var(--text); border: 1px solid var(--border); }
+button.btn.danger, a.btn.danger { background: transparent; color: var(--danger); border: 1px solid var(--danger); }
+button.btn:disabled, a.btn:disabled { opacity: .5; cursor: not-allowed; }
+
+input, select {
+  background: var(--bg); border: 1px solid var(--border); color: var(--text);
+  border-radius: 8px; padding: 9px 11px; font-size: 14px; width: 100%;
+}
+label { font-size: 12px; color: var(--muted); display: block; margin-bottom: 5px; }
+.field { margin-bottom: 13px; }
+
+.badge {
+  font-size: 11px; padding: 2px 8px; border-radius: 999px;
+  border: 1px solid var(--border); color: var(--muted);
+}
+.badge.ssh { color: #7dd3fc; border-color: #0369a1; }
+.badge.rdp { color: #f0abfc; border-color: #a21caf; }
+.badge.active { color: var(--ok); border-color: #065f46; }
+.badge.closed { color: var(--muted); }
+
+.login-wrap { display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+.login-card { width: 360px; }
+.login-card h1 { font-size: 22px; text-align: center; }
+.error { color: var(--danger); font-size: 13px; margin: 8px 0; }
+.muted { color: var(--muted); font-size: 13px; }
+
+.toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+
+dialog {
+  background: var(--panel); color: var(--text); border: 1px solid var(--border);
+  border-radius: 12px; padding: 22px; width: 440px; max-width: 92vw;
+}
+dialog::backdrop { background: rgba(0,0,0,.55); }
+
+.terminal-page, .desktop-page {
+  position: fixed; inset: 0; background: #000; display: flex; flex-direction: column;
+}
+.topbar {
+  height: 44px; background: var(--panel); border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; gap: 12px; padding: 0 16px; font-size: 13px;
+}
+.topbar .spacer { flex: 1; }
+#terminal, #desktop { flex: 1; overflow: hidden; }
+#desktop canvas { display: block; }
+
+.toast { font-size: 13px; color: var(--muted); }
+
+.error-overlay {
+  position: absolute; inset: 44px 0 0 0; background: rgba(0,0,0,.72);
+  display: flex; align-items: center; justify-content: center; z-index: 10;
+}
+.error-box {
+  background: var(--panel); border: 1px solid var(--danger); border-radius: 12px;
+  padding: 26px 30px; max-width: 480px;
+}
+.error-box h3 { margin: 0 0 12px; color: var(--danger); }
+.error-box p { font-size: 14px; line-height: 1.6; word-break: break-word; }

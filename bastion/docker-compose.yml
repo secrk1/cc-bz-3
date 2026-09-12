@@ -1,0 +1,104 @@
+name: bastion
+
+services:
+  # ---------- 前端：node:20-alpine 构建，nginx:1.27-alpine 托管 ----------
+  frontend:
+    build: ./frontend
+    image: bastion/frontend:latest
+    ports:
+      - "8080:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ---------- Python 后端：python:3.12-slim ----------
+  backend:
+    build: ./backend
+    image: bastion/backend:latest
+    environment:
+      DATABASE_URL: postgresql+asyncpg://bastion:bastion@db:5432/bastion
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET: ${JWT_SECRET:-please-change-this-secret}
+      ADMIN_USER: admin
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin123}
+      GUACD_HOST: guacd
+      GUACD_PORT: "4822"
+      RECORDING_DIR: /data/recordings
+    volumes:
+      - recordings:/data/recordings
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      guacd:
+        condition: service_started
+    restart: unless-stopped
+
+  # ---------- Redis：会话索引 / 临时凭证缓存 ----------
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # ---------- 轻量数据库：资产 / 会话 / 审计持久化 ----------
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: bastion
+      POSTGRES_PASSWORD: bastion
+      POSTGRES_DB: bastion
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bastion -d bastion"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # ---------- RDP 网关守护进程（guacd，内置 RDP 协议支持） ----------
+  guacd:
+    image: guacamole/guacd:1.5.5
+    restart: unless-stopped
+
+  # ---------- 内置 SSH 测试靶机 ----------
+  ssh-target:
+    image: linuxserver/openssh-server:latest
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      TZ: Asia/Shanghai
+      PASSWORD_ACCESS: "true"
+      USER_NAME: testuser
+      USER_PASSWORD: testpass
+      SUDO_ACCESS: "false"
+    # 容器内 sshd 监听 2222
+    expose:
+      - "2222"
+    restart: unless-stopped
+
+  # ---------- 内置 RDP 测试靶机（xrdp，默认账号 abc/abc） ----------
+  rdp-target:
+    image: linuxserver/rdesktop:ubuntu-xfce
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      TZ: Asia/Shanghai
+    shm_size: "1gb"
+    expose:
+      - "3389"
+    restart: unless-stopped
+
+volumes:
+  db-data:
+  redis-data:
+  recordings:
