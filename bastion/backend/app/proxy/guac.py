@@ -7,6 +7,12 @@
    ``select`` -> ``args`` -> ``size/audio/video/image/connect`` -> ``ready``；
 3. ``ready`` 之后双向透传全部指令（key/mouse/img/blob/sync 等）。
 
+保活：浏览器隧道在 OPEN 后每 500ms 发送一条**内部指令**
+（空操作码 ``0.,4.ping,<毫秒时间戳>;``），其 receiveTimeout 为 15s，每收到
+一帧才重置。官方 webapp 端点会把 ping **原样回显**；本桥在握手开始前就启动
+入站泵送任务，命中空操作码即回显、其余转发 guacd，且该任务贯穿整个会话——
+否则在耗时登录或 RDP 空闲无画面时，浏览器会在收到 ready/下一帧前就超时关闭。
+
 注意：Guacamole 元素是“长度前缀 + 内容”。img/blob 中的 PNG 等二进制数据
 在协议层由 guacd 做 **base64 编码**，因此整条链路都是合法 UTF-8 文本，
 浏览器 WebSocketTunnel 也只接受**文本帧**（收到二进制帧会直接解析失败）。
@@ -22,8 +28,9 @@ DEFAULT_WIDTH = 1280
 DEFAULT_HEIGHT = 800
 DEFAULT_DPI = 96
 
-# 握手（含 guacd 连目标 RDP 登录）最长等待时间
-HANDSHAKE_TIMEOUT = 20
+# 握手（含 guacd 连目标 RDP 登录）最长等待时间；浏览器侧靠 ping 回显保活，
+# 这里只对 guacd 无响应做兜底
+HANDSHAKE_TIMEOUT = 30
 
 
 class GuacError(RuntimeError):
@@ -94,43 +101,44 @@ def _reencode(opcode: str, args: list[bytes]) -> bytes:
     return b",".join(parts) + b";"
 
 
-def strip_internal_instructions(frame: bytes) -> bytes:
-    """移除浏览器隧道的内部指令（操作码为空串的 ping 帧），返回待转发字节。
+def parse_instructions(frame: bytes) -> list[tuple[bytes, list[bytes], bytes]]:
+    """把一个可能含多条指令的帧解析为 (opcode, args, 原始整段字节) 列表。
 
-    这些帧仅用于浏览器<->隧道保活，不能转发给 guacd，否则会触发协议错误。
-    全程按 **字节** 解析（Guacamole 元素长度即字节数），因此含多字节 UTF-8
-    的剪贴板等指令也能正确处理。
+    全程按字节解析（长度即字节数），多字节 UTF-8 元素也安全。
     """
-    kept = bytearray()
+    results: list[tuple[bytes, list[bytes], bytes]] = []
     pos = 0
     n = len(frame)
+
+    def read_element(p: int):
+        dot = frame.find(b".", p)
+        if dot == -1:
+            return None
+        try:
+            length = int(frame[p:dot])
+        except ValueError:
+            return None
+        end = dot + 1 + length
+        return frame[dot + 1:end], end
+
     while pos < n:
         start = pos
-        dot = frame.find(b".", pos)
-        if dot == -1:
+        head = read_element(pos)
+        if head is None:
             break
-        try:
-            opcode_len = int(frame[pos:dot])
-        except ValueError:
-            break
-        opcode = frame[dot + 1: dot + 1 + opcode_len]
-        pos = dot + 1 + opcode_len
-        # 逐元素跳过，直到命中指令结束符 ';'
+        opcode, pos = head
+        args: list[bytes] = []
         while pos < n and frame[pos:pos + 1] == b",":
             pos += 1  # 跳过逗号
-            d2 = frame.find(b".", pos)
-            if d2 == -1:
+            elem = read_element(pos)
+            if elem is None:
                 break
-            try:
-                elen = int(frame[pos:d2])
-            except ValueError:
-                break
-            pos = d2 + 1 + elen
+            value, pos = elem
+            args.append(value)
         if pos < n and frame[pos:pos + 1] == b";":
             pos += 1  # 消费分号
-        if opcode:
-            kept.extend(frame[start:pos])
-    return bytes(kept)
+        results.append((opcode, args, frame[start:pos]))
+    return results
 
 
 def _build_connect_args(arg_names: list[str], *, target_host: str,
@@ -243,7 +251,24 @@ async def bridge(websocket, *, guacd_host: str, guacd_port: int,
         tunnel_uuid = str(uuid.uuid4())
         await websocket.send_text(f"0.,{len(tunnel_uuid)}.{tunnel_uuid};")
 
-        # 2) 握手到 ready
+        # 2) 浏览器 -> guacd 泵送必须在握手期间就运行：
+        #    浏览器每 500ms 发内部 ping，官方端点会原样回显，浏览器据此重置
+        #    15s receiveTimeout。RDP 登录握手可能持续十几秒，若不回显，浏览器
+        #    会在我们收到 ready 之前就因超时而关闭。
+        async def ws_to_guacd() -> None:
+            async for message in websocket.iter_text():
+                for opcode, args, raw in parse_instructions(message.encode("utf-8")):
+                    if opcode == b"":
+                        # 内部指令不转发 guacd；仅 ping 原样回显（与官方端点一致）
+                        if args and args[0] == b"ping":
+                            await websocket.send_text(raw.decode("utf-8"))
+                    else:
+                        writer.write(raw)
+                        await writer.drain()
+
+        pump_task = asyncio.create_task(ws_to_guacd())
+
+        # 3) 握手到 ready（此期间浏览器的 ping 由上面的泵送任务回显）
         try:
             await asyncio.wait_for(
                 _handshake(guac, writer, target_host=target_host,
@@ -256,28 +281,19 @@ async def bridge(websocket, *, guacd_host: str, guacd_port: int,
                 f"RDP 握手超时（{HANDSHAKE_TIMEOUT}s）：目标 {target_host}:"
                 f"{target_port} 可达但未完成登录，请检查账号密码或目标桌面服务")
 
-        # 3) ready 后双向透传
+        # 4) ready 后启动 guacd -> 浏览器 透传，与入站泵一同运行
         async def guacd_to_ws() -> None:
             while True:
                 op, args = await guac.read_instruction()
                 # 协议为 UTF-8 文本（二进制经 base64），必须以文本帧下发
                 await websocket.send_text(_reencode(op, args).decode("utf-8"))
 
-        async def ws_to_guacd() -> None:
-            async for message in websocket.iter_text():
-                forwarded = strip_internal_instructions(message.encode("utf-8"))
-                if forwarded:
-                    writer.write(forwarded)
-                    await writer.drain()
-
-        tasks = {
-            asyncio.create_task(guacd_to_ws()),
-            asyncio.create_task(ws_to_guacd()),
-        }
-        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        for task in tasks:
+        forward_task = asyncio.create_task(guacd_to_ws())
+        await asyncio.wait({pump_task, forward_task},
+                           return_when=asyncio.FIRST_COMPLETED)
+        for task in (pump_task, forward_task):
             task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(pump_task, forward_task, return_exceptions=True)
     finally:
         writer.close()
         try:
