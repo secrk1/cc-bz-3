@@ -46,7 +46,7 @@ async def _send_guac_error(websocket: WebSocket, message: str,
                           code: int = 511) -> None:
     """下发 Guacamole error 指令后优雅关闭，让前端结束等待并展示原因。"""
     try:
-        await websocket.send_text(guac.encode_error(message, code).decode())
+        await websocket.send_text(guac.encode_error(message, code))
         await websocket.close(code=1000)
     except Exception:  # noqa: BLE001
         pass
@@ -127,7 +127,10 @@ async def ws_rdp(
         await websocket.close(code=1008)
         return
 
-    await websocket.accept()
+    # guacamole-common-js 的 WebSocketTunnel 以 "guacamole" 子协议建连；
+    # 若服务端不在 101 握手里回显该子协议，浏览器会按 RFC 6455 立即断开。
+    # 本端点仅服务于 Guacamole 客户端，子协议固定为 guacamole。
+    await websocket.accept(subprotocol="guacamole")
 
     async with SessionLocal() as db:
         asset = await db.get(Asset, asset_id)

@@ -1,22 +1,29 @@
 """Guacamole 协议桥：浏览器 guacamole-common-js <-> guacd。
 
-采用“服务端隧道”模式（与官方 guacamole webapp 的 WebSocketTunnel 等价）：
+采用“服务端隧道”模式：后端依据资产凭据自行驱动到 guacd 的握手，
+浏览器只负责渲染画面与回传键鼠输入。
 
-1. WebSocket 首帧向浏览器发送内部指令 ``0.,<len>.<uuid>;``，隧道据此进入 OPEN；
-2. 代理浏览器与 guacd 完成经典握手：
-   ``select`` -> ``args`` -> ``size/audio/video/image/connect`` -> ``ready``；
-3. ``ready`` 之后双向透传全部指令（key/mouse/img/blob/sync 等）。
+guacamole-common-js@1.5.0 的 WebSocketTunnel 行为（已从 npm 源码逐字确认）：
+- 浏览器把 connect 数据（token/分辨率）放在 WebSocket **查询串** 中，
+  不会在 socket 上发送任何 “4…” 包装帧；
+- socket 上收到什么就按长度前缀直接喂给 ``Guacamole.Parser``，
+  **不存在 '0'/'1' 隧道包装层**；
+- ``Parser`` 按 **Unicode 码点（字符）** 计元素长度并逐字符截取（非 UTF-8 字节），
+  故服务端下行必须按字符计数，多字节（剪贴板/文件名等）才不会被截歪；
+- 客户端收到的**首条指令**若为空操作码（``""``）且恰有 1 个参数，则被视为隧道
+  UUID（``INTERNAL_DATA_OPCODE``），据此 ``setUUID`` 并进入 ``OPEN``。
 
-保活：浏览器隧道在 OPEN 后每 500ms 发送一条**内部指令**
-（空操作码 ``0.,4.ping,<毫秒时间戳>;``），其 receiveTimeout 为 15s，每收到
-一帧才重置。官方 webapp 端点会把 ping **原样回显**；本桥在握手开始前就启动
-入站泵送任务，命中空操作码即回显、其余转发 guacd，且该任务贯穿整个会话——
-否则在耗时登录或 RDP 空闲无画面时，浏览器会在收到 ready/下一帧前就超时关闭。
+因此本桥的协议约定如下：
+1. 首帧下发空操作码 + 单参数 tunnel UUID：``0.,<len>.<uuid>;``；
+2. 之后把 guacd 的 Guacamole 协议流（select/connect/size/ready/img/key…）
+   按**字符计数**原样转发浏览器；
+3. 浏览器上行的是**字符计数**的真实 Guacamole 指令，按字符解析后，再用**字节计数**
+   重新编码转发给 guacd（guacd 按字节计长）。浏览器重发的 connect/select 已被本桥
+   在握手阶段自行发往 guacd，忽略；空操作码（ping/nop 保活）原样回显浏览器。
 
-注意：Guacamole 元素是“长度前缀 + 内容”。img/blob 中的 PNG 等二进制数据
-在协议层由 guacd 做 **base64 编码**，因此整条链路都是合法 UTF-8 文本，
-浏览器 WebSocketTunnel 也只接受**文本帧**（收到二进制帧会直接解析失败）。
-本桥解析仍基于 bytes（长度按字节计），向浏览器发送前按 UTF-8 还原为文本帧。
+注意：Guacamole 元素是“长度前缀 + 内容”。img/blob 中的 PNG 等二进制数据在协议层由
+guacd 做 base64 编码，因此整条链路都是合法 UTF-8 文本，浏览器 WebSocketTunnel 也只
+接受文本帧。
 """
 import asyncio
 import logging
@@ -41,14 +48,12 @@ class GuacError(RuntimeError):
         self.code = code
 
 
-def encode_error(message: str, code: int = 511) -> bytes:
-    """构造发送给浏览器的 error 指令：error,<message>,<code>;"""
-    safe = message.encode("utf-8", "replace")[:400].decode("utf-8", "replace")
-    return encode("error", [safe, str(code)])
-
-
 def encode(opcode: str, args: list[str] | None = None) -> bytes:
-    """编码一条 Guacamole 指令（仅用于本桥发起的握手指令，均为文本）。"""
+    """编码一条 Guacamole 指令（**字节计数**），用于：
+    - 本桥发起的握手指令（均为文本）；
+    - 把浏览器上行（字符计数）的指令重新编码后转发给 guacd。
+    guacd（C 实现）按 UTF-8 字节计长度，故此处长度取 ``encode('utf-8')`` 的字节数。
+    """
     parts = [f"{len(opcode.encode())}.{opcode}"]
     for value in args or []:
         raw = value.encode("utf-8")
@@ -56,8 +61,26 @@ def encode(opcode: str, args: list[str] | None = None) -> bytes:
     return (",".join(parts) + ";").encode()
 
 
+def _wrap(opcode: str, args: list[str] | None = None) -> str:
+    """编码一条发给浏览器的 Guacamole 指令（**字符/码点计数**）。
+
+    guacamole-common-js 的 ``Parser`` 按 Unicode 码点计长度并逐字符截取，
+    故下行必须按字符计数，剪贴板/文件名等多字节元素才不会被截歪。
+    """
+    parts = [f"{len(opcode)}.{opcode}"]
+    for value in args or []:
+        parts.append(f"{len(value)}.{value}")
+    return ",".join(parts) + ";"
+
+
+def encode_error(message: str, code: int = 511) -> str:
+    """构造发给浏览器的 error 指令帧（普通 Guacamole 指令，client.onerror 处理）。"""
+    safe = message.encode("utf-8", "replace")[:400].decode("utf-8", "replace")
+    return _wrap("error", [safe, str(code)])
+
+
 class GuacReader:
-    """按长度前缀解析指令，元素保留原始 bytes。"""
+    """按长度前缀（字节计数）解析 guacd 下行指令，元素保留原始 bytes。"""
 
     def __init__(self, reader: asyncio.StreamReader):
         self._reader = reader
@@ -94,50 +117,45 @@ class GuacReader:
         return opcode, args
 
 
-def _reencode(opcode: str, args: list[bytes]) -> bytes:
-    parts = [f"{len(opcode.encode())}.{opcode}".encode()]
-    for raw in args:
-        parts.append(str(len(raw)).encode() + b"." + raw)
-    return b",".join(parts) + b";"
+def parse_client_tunnel(frame: str) -> list[tuple[str, list[str]]]:
+    """按 Guacamole 指令（**字符计数**）解析浏览器上行文本帧。
 
-
-def parse_instructions(frame: bytes) -> list[tuple[bytes, list[bytes], bytes]]:
-    """把一个可能含多条指令的帧解析为 (opcode, args, 原始整段字节) 列表。
-
-    全程按字节解析（长度即字节数），多字节 UTF-8 元素也安全。
+    guacamole-common-js 用字符计数，故此处按 ``str`` 长度（码点）解析，
+    返回 ``(opcode, args)`` 列表；空 opcode 表示隧道内部指令（ping/nop 等）。
     """
-    results: list[tuple[bytes, list[bytes], bytes]] = []
-    pos = 0
+    results: list[tuple[str, list[str]]] = []
+    i = 0
     n = len(frame)
 
-    def read_element(p: int):
-        dot = frame.find(b".", p)
+    def read_element(start: int):
+        dot = frame.find(".", start)
         if dot == -1:
             return None
         try:
-            length = int(frame[p:dot])
+            length = int(frame[start:dot])
         except ValueError:
             return None
         end = dot + 1 + length
+        if end > n:
+            return None
         return frame[dot + 1:end], end
 
-    while pos < n:
-        start = pos
-        head = read_element(pos)
+    while i < n:
+        head = read_element(i)
         if head is None:
             break
-        opcode, pos = head
-        args: list[bytes] = []
-        while pos < n and frame[pos:pos + 1] == b",":
-            pos += 1  # 跳过逗号
-            elem = read_element(pos)
+        opcode, i = head
+        args: list[str] = []
+        while i < n and frame[i] == ",":
+            i += 1  # 跳过逗号
+            elem = read_element(i)
             if elem is None:
                 break
-            value, pos = elem
+            value, i = elem
             args.append(value)
-        if pos < n and frame[pos:pos + 1] == b";":
-            pos += 1  # 消费分号
-        results.append((opcode, args, frame[start:pos]))
+        if i < n and frame[i] == ";":
+            i += 1  # 消费分号
+        results.append((opcode, args))
     return results
 
 
@@ -164,10 +182,15 @@ def _build_connect_args(arg_names: list[str], *, target_host: str,
     return [values.get(name, "") for name in arg_names]
 
 
-async def _handshake(guac: "GuacReader", writer: asyncio.StreamWriter, *,
-                     target_host: str, target_port: int, username: str,
-                     password: str, width: int, height: int) -> list[str]:
-    """完成到 ready 为止的 guacd 握手，成功返回 guacd 声明的参数名列表。"""
+async def _handshake(guac: "GuacReader", writer: asyncio.StreamWriter,
+                     websocket=None, *, target_host: str, target_port: int,
+                     username: str, password: str, width: int,
+                     height: int) -> list[str]:
+    """完成到 ready 为止的 guacd 握手，成功返回 guacd 声明的参数名列表。
+
+    guacd 下行的 ready/error 等为普通 Guacamole 指令，按**字符计数**转发浏览器
+    （``_wrap``）；websocket 为 None（如连通性探测）时跳过转发。
+    """
     writer.write(encode("select", ["rdp"]))
     await writer.drain()
 
@@ -193,17 +216,23 @@ async def _handshake(guac: "GuacReader", writer: asyncio.StreamWriter, *,
 
     while True:
         sub_opcode, sub_args = await guac.read_instruction()
+        decoded = [a.decode("utf-8", "replace") for a in sub_args]
         if sub_opcode == "ready":
+            if websocket is not None:
+                await websocket.send_text(_wrap("ready", decoded))
             logger.info("guacd 已就绪：%s:%s 登录成功", target_host, target_port)
             return arg_names
         if sub_opcode == "error":
-            reason = (sub_args[0].decode("utf-8", "replace")
-                      if sub_args else "未知错误")
+            if websocket is not None:
+                await websocket.send_text(_wrap("error", decoded))
+            reason = decoded[0] if decoded else "未知错误"
             code = 511
-            if len(sub_args) > 1 and sub_args[1].isdigit():
-                code = int(sub_args[1])
+            if len(decoded) > 1 and decoded[1].isdigit():
+                code = int(decoded[1])
             raise GuacError(f"目标 RDP 拒绝连接：{reason}", code)
         logger.info("ready 前指令：%s", sub_opcode)
+        if websocket is not None:
+            await websocket.send_text(_wrap(sub_opcode, decoded))
 
 
 async def probe_rdp(*, guacd_host: str, guacd_port: int, target_host: str,
@@ -247,31 +276,35 @@ async def bridge(websocket, *, guacd_host: str, guacd_port: int,
     try:
         guac = GuacReader(reader)
 
-        # 1) 首帧：内部指令携带隧道 UUID
+        # 1) 首帧：空操作码 + 单参数 tunnel UUID（guacamole-common-js 据此 setUUID + OPEN）
         tunnel_uuid = str(uuid.uuid4())
-        await websocket.send_text(f"0.,{len(tunnel_uuid)}.{tunnel_uuid};")
+        await websocket.send_text(_wrap("", [tunnel_uuid]))
 
-        # 2) 浏览器 -> guacd 泵送必须在握手期间就运行：
-        #    浏览器每 500ms 发内部 ping，官方端点会原样回显，浏览器据此重置
-        #    15s receiveTimeout。RDP 登录握手可能持续十几秒，若不回显，浏览器
-        #    会在我们收到 ready 之前就因超时而关闭。
+        # 2) 浏览器 -> guacd 泵送（贯穿整个会话）：
+        #    - 空 opcode（ping/nop 等内部指令）：原样回显给浏览器以重置 15s
+        #      receiveTimeout 保活；
+        #    - connect/select：浏览器重发，本桥已在握手阶段发给 guacd，忽略；
+        #    - 其余真实 opcode（key/mouse/...）：按字节计数重新编码后转发 guacd。
         async def ws_to_guacd() -> None:
             async for message in websocket.iter_text():
-                for opcode, args, raw in parse_instructions(message.encode("utf-8")):
-                    if opcode == b"":
-                        # 内部指令不转发 guacd；仅 ping 原样回显（与官方端点一致）
-                        if args and args[0] == b"ping":
-                            await websocket.send_text(raw.decode("utf-8"))
+                if not message:
+                    continue
+                for opcode, args in parse_client_tunnel(message):
+                    if not opcode:
+                        # 浏览器内部指令（ping/nop）：原样回显以保活
+                        await websocket.send_text(_wrap(opcode, args))
+                    elif opcode in ("connect", "select"):
+                        continue  # 本桥已驱动握手，忽略浏览器重发的
                     else:
-                        writer.write(raw)
+                        writer.write(encode(opcode, args))
                         await writer.drain()
 
         pump_task = asyncio.create_task(ws_to_guacd())
 
-        # 3) 握手到 ready（此期间浏览器的 ping 由上面的泵送任务回显）
+        # 3) 握手到 ready（此期间浏览器的 ping 由上面的泵送任务回显保活）
         try:
             await asyncio.wait_for(
-                _handshake(guac, writer, target_host=target_host,
+                _handshake(guac, writer, websocket, target_host=target_host,
                            target_port=target_port, username=username,
                            password=password, width=width, height=height),
                 timeout=HANDSHAKE_TIMEOUT,
@@ -285,8 +318,8 @@ async def bridge(websocket, *, guacd_host: str, guacd_port: int,
         async def guacd_to_ws() -> None:
             while True:
                 op, args = await guac.read_instruction()
-                # 协议为 UTF-8 文本（二进制经 base64），必须以文本帧下发
-                await websocket.send_text(_reencode(op, args).decode("utf-8"))
+                await websocket.send_text(
+                    _wrap(op, [a.decode("utf-8", "replace") for a in args]))
 
         forward_task = asyncio.create_task(guacd_to_ws())
         await asyncio.wait({pump_task, forward_task},
@@ -294,6 +327,16 @@ async def bridge(websocket, *, guacd_host: str, guacd_port: int,
         for task in (pump_task, forward_task):
             task.cancel()
         await asyncio.gather(pump_task, forward_task, return_exceptions=True)
+    except Exception as e:
+        # 把错误以 error 指令形式透传给浏览器，避免静默断开
+        try:
+            if isinstance(e, GuacError):
+                await websocket.send_text(encode_error(str(e), e.code))
+            else:
+                await websocket.send_text(encode_error(f"隧道异常：{e}", 511))
+        except Exception:
+            pass
+        raise
     finally:
         writer.close()
         try:
