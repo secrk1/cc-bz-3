@@ -4,9 +4,9 @@
 查询参数传递 JWT。每个连接：
 1. 校验 JWT -> 用户；
 2. 加载资产并解密凭证（经 Redis 做短期凭证缓存）；
-3. 创建会话记录（DB + Redis 活跃索引）；
+3. 创建会话记录（DB + Redis 活跃索引），SSH 侧打开异步录像器；
 4. 进入对应代理桥；
-5. 结束时关闭会话、记录审计。
+5. 结束时关闭录像器（排空落盘）、关闭会话、记录审计。
 """
 import json
 import logging
@@ -23,7 +23,13 @@ from app.models import Asset, User
 from app.proxy import guac, tcp_relay
 from app.proxy.ssh_tunnel import run_ssh_session
 from app.redis_client import credential_key, redis_client
-from app.services.audit import close_session, open_session, write_audit
+from app.services.audit import (
+    attach_command_summary,
+    close_session,
+    open_session,
+    write_audit,
+)
+from app.services.recorder import AsyncCastRecorder, ensure_recording_dir
 
 logger = logging.getLogger("ws")
 router = APIRouter()
@@ -87,27 +93,47 @@ async def ws_ssh(
 
         password = await _load_credential(asset)
         session_id = uuid.uuid4().hex
-        os.makedirs(settings.recording_dir, exist_ok=True)
-        recording_path = os.path.join(settings.recording_dir, f"{session_id}.cast")
+        ensure_recording_dir(settings.recording_dir)
+        recording_path = os.path.join(settings.recording_dir,
+                                      f"{session_id}.cast")
         client_ip = websocket.client.host if websocket.client else None
 
-        await open_session(db, session_id=session_id, user_id=user.id,
-                           asset_id=asset.id, protocol="ssh", client_ip=client_ip,
-                           recording_path=recording_path)
-        await write_audit(db, session_id, "login", f"SSH 登录 {asset.host}")
+        # 先打开异步录像器（写 header、起 worker），成功后会话才挂录像路径
+        recorder = await AsyncCastRecorder.open(
+            recording_path, cols=cols, rows=rows)
 
-        async def on_command(cmd: str) -> None:
-            await write_audit(db, session_id, "command", cmd)
+        try:
+            await open_session(db, session_id=session_id, user_id=user.id,
+                               asset_id=asset.id, protocol="ssh", client_ip=client_ip,
+                               recording_path=recording_path)
+            await write_audit(db, session_id, "login", f"SSH 登录 {asset.host}")
+        except Exception:
+            logger.exception("会话初始化失败: %s", session_id)
+            await recorder.aclose()
+            raise
+
+        async def on_command(cmd: str) -> int:
+            log = await write_audit(db, session_id, "command", cmd)
+            return log.id
+
+        async def on_command_summary(log_id: int, summary: str) -> None:
+            # 由 worker 定时器任务触发，可能与主循环的 DB 操作并发，
+            # 使用独立 DB 会话避免跨协程共用 AsyncSession
+            async with SessionLocal() as sdb:
+                await attach_command_summary(sdb, log_id, summary)
 
         async def on_close() -> None:
+            # 先排空录像队列并关文件，保证回放文件完整，再关闭会话
+            await recorder.aclose()
             await write_audit(db, session_id, "close", "会话结束")
             await close_session(db, session_id)
 
         try:
             await run_ssh_session(
                 websocket, asset=asset, password=password, session_id=session_id,
-                cols=cols, rows=rows, on_command=on_command, on_close=on_close,
-                recording_path=recording_path,
+                cols=cols, rows=rows, on_command=on_command,
+                on_command_summary=on_command_summary, on_close=on_close,
+                recorder=recorder,
             )
         except WebSocketDisconnect:
             pass
@@ -141,8 +167,14 @@ async def ws_rdp(
         password = await _load_credential(asset)
         session_id = uuid.uuid4().hex
         client_ip = websocket.client.host if websocket.client else None
+        # guacd 图形录制文件：{recording_dir}/{session_id}（guacd 不加扩展名），
+        # 需与 guacd 容器共享同一卷、同一路径（见 docker-compose）。
+        # ensure_recording_dir 会建目录并 chmod 1777，guacd(uid 1000) 才可写。
+        ensure_recording_dir(settings.recording_dir)
+        recording_base = os.path.join(settings.recording_dir, session_id)
         await open_session(db, session_id=session_id, user_id=user.id,
-                           asset_id=asset.id, protocol="rdp", client_ip=client_ip)
+                           asset_id=asset.id, protocol="rdp", client_ip=client_ip,
+                           recording_path=recording_base)
         await write_audit(db, session_id, "login",
                           f"RDP 连接 {asset.host}:{asset.port}")
         try:
@@ -151,6 +183,8 @@ async def ws_rdp(
                 guacd_port=settings.guacd_port, target_host=asset.host,
                 target_port=asset.port, username=asset.username,
                 password=password or "", width=width, height=height,
+                recording_path=settings.recording_dir,
+                recording_name=session_id,
             )
         except guac.GuacError as exc:
             logger.warning("RDP 握手失败 [%s] -> %s", asset.name, exc)

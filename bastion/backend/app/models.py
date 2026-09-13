@@ -53,6 +53,7 @@ class SessionRecord(Base):
                                                       nullable=True)
 
     asset: Mapped[Asset] = relationship(back_populates="sessions")
+    user: Mapped[User] = relationship()
     audit_logs: Mapped[list["AuditLog"]] = relationship(
         back_populates="session", cascade="all, delete-orphan")
 
@@ -65,6 +66,8 @@ class AuditLog(Base):
     session_id: Mapped[str] = mapped_column(ForeignKey("sessions.id"), index=True)
     event_type: Mapped[str] = mapped_column(String(32))  # command / login / close
     content: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 命令执行后终端响应的去 ANSI 摘要（静默窗口定稿后回写）
+    response_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True),
                                                  server_default=func.now())
 

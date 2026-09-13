@@ -45,10 +45,14 @@ class AssetOut(BaseModel):
 class SessionOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: str
+    user_id: int
+    user_name: str
     asset_id: int
+    asset_name: str
     protocol: str
     status: str
     client_ip: str | None
+    recording_path: str | None
     started_at: datetime
     ended_at: datetime | None
 
@@ -59,4 +63,5 @@ class AuditOut(BaseModel):
     session_id: str
     event_type: str
     content: str | None
+    response_summary: str | None = None
     created_at: datetime

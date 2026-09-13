@@ -6,7 +6,7 @@ services:
     build: ./frontend
     image: bastion/frontend:latest
     ports:
-      - "8080:80"
+      - "9080:80"
     depends_on:
       backend:
         condition: service_healthy
@@ -68,6 +68,10 @@ services:
   # ---------- RDP 网关守护进程（guacd，内置 RDP 协议支持） ----------
   guacd:
     image: guacamole/guacd:1.5.5
+    volumes:
+      # 与 backend 共享录像目录且路径必须一致：connect 参数中的
+      # recording-path 由 guacd 进程直接写文件，backend 再读出发放/回放
+      - recordings:/data/recordings
     restart: unless-stopped
 
   # ---------- 内置 SSH 测试靶机 ----------

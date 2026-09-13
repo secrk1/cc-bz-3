@@ -6,7 +6,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api import assets, auth, sessions, ws
+from app.config import settings
 from app.redis_client import redis_client
+from app.services.recorder import ensure_recording_dir
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -14,6 +16,8 @@ logging.basicConfig(level=logging.INFO,
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # 共享卷首次由 root 创建时 guacd(uid 1000) 不可写，启动即放开为 1777
+    ensure_recording_dir(settings.recording_dir)
     yield
     await redis_client.aclose()
 

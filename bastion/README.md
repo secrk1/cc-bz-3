@@ -4,7 +4,11 @@
 
 - 🖥️ **Web SSH 终端**：浏览器 xterm.js ↔ WebSocket ↔ asyncssh PTY，全双工、高并发；
 - 🖼️ **RDP 远程桌面中继**：浏览器 guacamole-common-js ↔ 自研 Guacamole 协议桥 ↔ guacd ↔ 目标 RDP；另提供协议无关的裸 TCP 中继网关；
-- 🧾 **指令审计与录屏**：命令级审计入库，SSH 会话输出录制为 asciicast v2 可回放下载；
+- 🎬 **双协议会话回放**：SSH 会话双向 I/O 经**独立异步队列**实时落盘为
+  asciicast v2；RDP 会话由 **guacd 原生图形录制**（带 sync 时间戳的指令流）。
+  会话审计页可直接**在线交互回放**（播放/暂停/拖动/倍速/跳空闲，RDP 为桌面
+  画面回放，SSH 为终端回放），录像文件也可下载；
+- 🧾 **指令审计**：命令级审计入库（含命令响应摘要）；
 - 🗂️ **资产管理 / 会话记录 / Redis 会话与凭证缓存 / PostgreSQL 持久化**；
 - 🎯 内置 **SSH 靶机**与 **RDP 靶机**，`docker compose up -d` 后即可在浏览器端到端验证。
 
@@ -42,13 +46,15 @@ bastion/
 │       ├── models.py  schemas.py  security.py  crypto.py  seed.py
 │       ├── api/                auth / assets / sessions / WebSocket 路由
 │       ├── proxy/
-│       │   ├── ssh_tunnel.py   ★ asyncssh PTY 桥 + 指令审计 + 录屏
+│       │   ├── ssh_tunnel.py   ★ asyncssh PTY 桥 + 指令审计 + 录像喂入 + 响应摘要
 │       │   ├── guac.py         ★ Guacamole 协议桥（服务端握手 + 二进制安全透传）
 │       │   └── tcp_relay.py    ★ 原生 TCP 中继网关
-│       └── services/audit.py
+│       └── services/
+│           ├── audit.py        会话生命周期 / 审计行 / 摘要回写
+│           └── recorder.py     ★ 异步无阻塞 asciicast v2 录屏引擎
 └── frontend/                   node:20-alpine 构建 → nginx:1.27-alpine
     ├── Dockerfile  nginx.conf  vite.config.js
-    └── src/ (登录 / 资产 / SSH 终端 / RDP 桌面 / 会话审计)
+    └── src/ (登录 / 资产 / SSH 终端 / RDP 桌面 / 会话审计与 CastPlayer 回放)
 ```
 
 ## 快速开始
@@ -80,8 +86,10 @@ docker compose up -d --build      # 旧版 Docker 可用: docker-compose up -d -
    ls -al
    ```
 
-3. 回到 **会话审计** 页，点开最新会话的「审计」，可看到每一条回车提交的命令；
-   SSH 会话还可 **下载录屏 (.cast)**，用 [asciinema](https://asciinema.org/) 回放：
+3. 回到 **会话审计** 页，点开最新会话的「审计」，可看到每一条回车提交的命令及其
+   **响应摘要**（输出静默 0.3s 后自动去 ANSI 截取）；离线 SSH 会话点击 **▶ 回放**
+   即可在页面内按原始时间轴交互播放（暂停/拖动进度/0.5–4 倍速/跳过空闲/按命令定位），
+   也可下载后用 [asciinema](https://asciinema.org/) 回放：
    `asciinema play <会话id>.cast`。
 
 ### 2. RDP 远程桌面
@@ -90,6 +98,9 @@ docker compose up -d --build      # 旧版 Docker 可用: docker-compose up -d -
 2. 顶栏状态依次为 `连接中 → 等待中 → 已连接`，页面呈现 XFCE 桌面
    （xrdp 已用资产中保存的 abc/abc 自动登录，无需再输密码）；
 3. 可在桌面内打开终端操作；关闭页面即断开，会话与连接事件记入审计。
+4. 回到 **会话审计** 页，离线的 RDP 会话点击 **▶ 回放**，可在页面内按原始
+   时间轴播放桌面操作画面（guacamole-common-js `SessionRecording` 渲染 guacd
+   录制的图形指令流，支持暂停/拖动/倍速），也可下载 `.guac` 录像留档。
 4. **若连接失败**：页面会弹出后端回传的 guacd 真实错误原因；也可在资产页点
    **连通性**——后端会对 SSH 做真实握手鉴权、对 RDP 经 guacd 走完整登录握手，
    并把成功/失败原因直接显示在资产行下方。排障时配合
@@ -106,8 +117,27 @@ docker compose up -d --build      # 旧版 Docker 可用: docker-compose up -d -
 - **异步高并发**：所有会话在事件循环中以协程运行，单进程即可承载大量并发
   SSH/Guacamole 会话；SSH 以 bytes 收发（`encoding=None`），`top`/`vim` 等
   全屏二进制程序不乱码。
-- **指令审计**：在输入流维护行缓冲（处理退格、Ctrl-C/U），回车提交时抽取
-  最终命令行写库；输出侧录制 asciicast v2 形成完整审计闭环。
+- **指令审计与响应摘要**：在输入流维护行缓冲（处理退格、Ctrl-C/U），回车提交时
+  抽取最终命令行写库并拿到审计行 ID；随后累积该命令的 PTY 输出，输出静默
+  0.3s（或下一条命令提交、或断连）后做 ANSI 剥离/提示符剔除/截断，按行 ID
+  精确回写响应摘要，杜绝快速连敲命令时摘要串挂。
+- **异步录屏引擎**（`services/recorder.py`）：转发热路径对每个 I/O 块只做一次
+  有界 `asyncio.Queue.put_nowait`（纯内存 O(1)，实测 10 万次入队 < 55ms），
+  独立 worker 协程攒批（40ms 窗口）后经 `asyncio.to_thread` 阻塞 write/flush，
+  磁盘再慢也不拖慢终端；队列满时丢输出帧并计数告警（不无限吃内存），输入帧
+  退化为最多 50ms 异步入队；事件偏移在入队时用 monotonic 盖戳，关闭时限时 5s
+  排空落盘。文件为标准 asciicast v2（`i`/`o` 双向事件）。
+- **在线回放（双协议）**：仅离线会话可取录像（在线返回 409）。SSH 用
+  `CastPlayer.vue`（xterm.js 自包含解析 v2，rAF 驱动虚拟时间轴，倍速/跳空闲/
+  按命令定位）；RDP 用 `GuacPlayer.vue`（guacamole-common-js `SessionRecording`
+  把 guacd 录制的带 `sync` 时间戳指令流作为 Blob 读入，内部回放 Client 逐帧
+  重绘桌面，1x 走原生 play()、非 1x 以 ~8fps 定时 seek() 步进实现倍速）。
+- **RDP 图形录制**：握手时经 `recording-path`/`recording-name`/
+  `create-recording-path`/`recording-include-keys` 让 guacd 在服务端直接把
+  图形指令流写进与 backend 共享的命名卷（同路径 `/data/recordings`），无需
+  guacenc/ffmpeg；guacd 以 uid 1000 运行而目录由 root(0755) 创建会写不进，
+  故启动及每次会话前把共享目录 chmod 1777。连通性探测 `probe_rdp` 不录制，
+  避免产生空录像。
 - **凭证安全**：资产口令/密钥用 Fernet 对称加密入库（密钥由 `JWT_SECRET`
   派生），运行时解密后写入 Redis 并设短 TTL（`CREDENTIAL_TTL` 默认 300s）。
 - **Guacamole 桥**：严格实现 guacd 服务端隧道握手

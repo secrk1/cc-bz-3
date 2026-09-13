@@ -36,6 +36,22 @@ async def close_session(db: AsyncSession, session_id: str) -> None:
 
 
 async def write_audit(db: AsyncSession, session_id: str, event_type: str,
-                      content: str | None = None) -> None:
-    db.add(AuditLog(session_id=session_id, event_type=event_type, content=content))
+                      content: str | None = None) -> AuditLog:
+    log = AuditLog(session_id=session_id, event_type=event_type, content=content)
+    db.add(log)
     await db.commit()
+    await db.refresh(log)
+    return log
+
+
+async def attach_command_summary(db: AsyncSession, log_id: int,
+                                 summary: str) -> None:
+    """把命令响应摘要精确补写到指定的 command 审计行上。
+
+    SSH 桥在命令提交时拿到审计行 ID，命令输出静默后按 ID 回写，
+    避免与下一条快速提交的命令串挂。
+    """
+    log = await db.get(AuditLog, log_id)
+    if log is not None and log.event_type == "command":
+        log.response_summary = summary
+        await db.commit()

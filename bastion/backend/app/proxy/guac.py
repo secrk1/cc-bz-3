@@ -161,7 +161,9 @@ def parse_client_tunnel(frame: str) -> list[tuple[str, list[str]]]:
 
 def _build_connect_args(arg_names: list[str], *, target_host: str,
                         target_port: int, username: str, password: str,
-                        width: int, height: int) -> list[str]:
+                        width: int, height: int,
+                        recording_path: str | None = None,
+                        recording_name: str | None = None) -> list[str]:
     values = {
         "hostname": target_host,
         "port": str(target_port),
@@ -179,13 +181,26 @@ def _build_connect_args(arg_names: list[str], *, target_host: str,
         "resize-method": "display-update",
         "enable-font-smoothing": "true",
     }
+    if recording_path:
+        # guacd 原生图形会话录制：把整段 Guacamole 协议指令流（含 sync
+        # 时间戳）写入 recording-path/recording-name，会话结束后封口，
+        # 供 guacamole-common-js SessionRecording 回放。
+        values.update({
+            "recording-path": recording_path,
+            "recording-name": recording_name or "recording",
+            # 目录不存在时由 guacd 自建；已存在则无副作用
+            "create-recording-path": "true",
+            # 同时记录键盘事件，使回放含操作轨迹
+            "recording-include-keys": "true",
+        })
     return [values.get(name, "") for name in arg_names]
 
 
 async def _handshake(guac: "GuacReader", writer: asyncio.StreamWriter,
                      websocket=None, *, target_host: str, target_port: int,
                      username: str, password: str, width: int,
-                     height: int) -> list[str]:
+                     height: int, recording_path: str | None = None,
+                     recording_name: str | None = None) -> list[str]:
     """完成到 ready 为止的 guacd 握手，成功返回 guacd 声明的参数名列表。
 
     guacd 下行的 ready/error 等为普通 Guacamole 指令，按**字符计数**转发浏览器
@@ -202,7 +217,8 @@ async def _handshake(guac: "GuacReader", writer: asyncio.StreamWriter,
 
     ordered = _build_connect_args(
         arg_names, target_host=target_host, target_port=target_port,
-        username=username, password=password, width=width, height=height)
+        username=username, password=password, width=width, height=height,
+        recording_path=recording_path, recording_name=recording_name)
     logger.info("connect 参数: %s",
                 {n: ("***" if n == "password" and v else v)
                  for n, v in zip(arg_names, ordered)})
@@ -265,8 +281,13 @@ async def probe_rdp(*, guacd_host: str, guacd_port: int, target_host: str,
 async def bridge(websocket, *, guacd_host: str, guacd_port: int,
                  target_host: str, target_port: int, username: str,
                  password: str, width: int = DEFAULT_WIDTH,
-                 height: int = DEFAULT_HEIGHT) -> None:
-    """建立到 guacd 的隧道并与给定 websocket 双向桥接，直到任一端关闭。"""
+                 height: int = DEFAULT_HEIGHT,
+                 recording_path: str | None = None,
+                 recording_name: str | None = None) -> None:
+    """建立到 guacd 的隧道并与给定 websocket 双向桥接，直到任一端关闭。
+
+    recording_path/name 非空时开启 guacd 原生图形录制（写指令流文件）。
+    """
     reader, writer = await asyncio.wait_for(
         asyncio.open_connection(guacd_host, guacd_port), timeout=5
     )
@@ -306,7 +327,9 @@ async def bridge(websocket, *, guacd_host: str, guacd_port: int,
             await asyncio.wait_for(
                 _handshake(guac, writer, websocket, target_host=target_host,
                            target_port=target_port, username=username,
-                           password=password, width=width, height=height),
+                           password=password, width=width, height=height,
+                           recording_path=recording_path,
+                           recording_name=recording_name),
                 timeout=HANDSHAKE_TIMEOUT,
             )
         except asyncio.TimeoutError:
