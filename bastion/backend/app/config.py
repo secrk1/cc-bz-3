@@ -25,6 +25,9 @@ class Settings(BaseSettings):
     # 录屏（asciicast v2）落盘目录
     recording_dir: str = "/data/recordings"
 
+    # 分片上传暂存目录（分片先落本地，完成后经 SFTP 写入目标）
+    sftp_tmp_dir: str = "/data/sftp_tmp"
+
     # guacd RDP 网关守护进程
     guacd_host: str = "guacd"
     guacd_port: int = 4822

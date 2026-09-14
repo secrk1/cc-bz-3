@@ -1,7 +1,7 @@
 """ORM 模型：用户 / 资产 / 会话 / 审计日志。"""
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, func
+from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -72,3 +72,29 @@ class AuditLog(Base):
                                                  server_default=func.now())
 
     session: Mapped[SessionRecord] = relationship(back_populates="audit_logs")
+
+
+class FileTransfer(Base):
+    """文件传输审计：Web-SFTP 的上传/下载记录（含 MD5、大小与状态）。"""
+    __tablename__ = "file_transfers"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    transfer_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    asset_id: Mapped[int] = mapped_column(ForeignKey("assets.id"), index=True)
+    direction: Mapped[str] = mapped_column(String(8))  # upload / download
+    filename: Mapped[str] = mapped_column(String(512))
+    remote_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    size: Mapped[int] = mapped_column(BigInteger, default=0)
+    bytes_done: Mapped[int] = mapped_column(BigInteger, default=0)
+    md5: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    # uploading / success / failed / aborted
+    status: Mapped[str] = mapped_column(String(16), default="uploading", index=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True),
+                                                 server_default=func.now())
+    finished_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True)
+
+    user: Mapped[User] = relationship()
+    asset: Mapped[Asset] = relationship()

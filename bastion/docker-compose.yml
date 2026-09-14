@@ -27,6 +27,7 @@ services:
       RECORDING_DIR: /data/recordings
     volumes:
       - recordings:/data/recordings
+      - sftp-tmp:/data/sftp_tmp
     depends_on:
       db:
         condition: service_healthy
@@ -106,3 +107,4 @@ volumes:
   db-data:
   redis-data:
   recordings:
+  sftp-tmp:

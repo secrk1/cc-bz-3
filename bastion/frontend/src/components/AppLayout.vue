@@ -3,9 +3,10 @@
     <aside class="sidebar">
       <div class="brand">🛡️ 轻量堡垒机</div>
       <router-link to="/">资产主机</router-link>
-      <router-link to="/sessions">会话审计</router-link>
+      <router-link v-if="isAdmin" to="/sessions">会话审计</router-link>
+      <router-link v-if="isAdmin" to="/transfers">传输记录</router-link>
       <div class="spacer"></div>
-      <div class="user">当前用户：{{ username }}</div>
+      <div class="user">当前用户：{{ username }}{{ isAdmin ? '（管理员）' : '' }}</div>
       <div style="padding:0 6px;">
         <button @click="logout">退出登录</button>
       </div>
@@ -21,10 +22,12 @@ import { onMounted, ref } from 'vue'
 import api from '../api'
 
 const username = ref('')
+const isAdmin = ref(false)
 onMounted(async () => {
   try {
     const { data } = await api.get('/api/auth/me')
     username.value = data.username
+    isAdmin.value = !!data.is_admin
   } catch { /* 拦截器处理 */ }
 })
 

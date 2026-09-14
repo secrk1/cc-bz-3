@@ -1,4 +1,4 @@
-"""会话记录与指令审计查询；录屏回放文件下载。"""
+"""会话记录、指令审计、录像回放与在线强踢（仅管理员）。"""
 import os
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -10,9 +10,13 @@ from sqlalchemy.orm import selectinload
 from app.database import get_db
 from app.models import AuditLog, SessionRecord, User
 from app.schemas import AuditOut, SessionOut
-from app.security import get_current_user
+from app.security import require_admin
+from app.services.audit import write_audit
+from app.services.live import publish_control
 
-router = APIRouter(prefix="/api/sessions", tags=["sessions"])
+# 会话管理/审计/录像/强踢全部为管理员能力
+router = APIRouter(prefix="/api/sessions", tags=["sessions"],
+                   dependencies=[Depends(require_admin)])
 
 
 @router.get("", response_model=list[SessionOut])
@@ -20,7 +24,6 @@ async def list_sessions(
     status: str | None = Query(default=None, pattern="^(active|closed)$"),
     protocol: str | None = Query(default=None, pattern="^(ssh|rdp|tcp)$"),
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(get_current_user),
 ) -> list[dict]:
     stmt = (
         select(SessionRecord)
@@ -52,11 +55,40 @@ async def list_sessions(
     ]
 
 
+@router.get("/{session_id}", response_model=SessionOut)
+async def get_session(
+    session_id: str,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    record = (
+        await db.scalars(
+            select(SessionRecord)
+            .options(selectinload(SessionRecord.asset),
+                     selectinload(SessionRecord.user))
+            .where(SessionRecord.id == session_id)
+        )
+    ).first()
+    if record is None:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    return {
+        "id": record.id,
+        "user_id": record.user_id,
+        "user_name": record.user.username if record.user else f"#{record.user_id}",
+        "asset_id": record.asset_id,
+        "asset_name": record.asset.name if record.asset else f"#{record.asset_id}",
+        "protocol": record.protocol,
+        "status": record.status,
+        "client_ip": record.client_ip,
+        "recording_path": record.recording_path,
+        "started_at": record.started_at,
+        "ended_at": record.ended_at,
+    }
+
+
 @router.get("/{session_id}/audit", response_model=list[AuditOut])
 async def session_audit(
     session_id: str,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(get_current_user),
 ) -> list[AuditLog]:
     return list(await db.scalars(
         select(AuditLog)
@@ -65,11 +97,28 @@ async def session_audit(
     ))
 
 
+@router.post("/{session_id}/kick")
+async def kick_session(
+    session_id: str,
+    db: AsyncSession = Depends(get_db),
+    admin: User = Depends(require_admin),
+) -> dict:
+    """强制结束一个在线会话：经 Redis 控制频道通知代理桥断开。"""
+    record = await db.get(SessionRecord, session_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    if record.status != "active":
+        raise HTTPException(status_code=409, detail="会话不在线，无需强踢")
+    await write_audit(db, session_id, "kick",
+                      f"管理员 {admin.username} 强制结束会话")
+    await publish_control(session_id, "kick")
+    return {"ok": True}
+
+
 @router.get("/{session_id}/recording")
 async def download_recording(
     session_id: str,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(get_current_user),
 ) -> FileResponse:
     record = await db.get(SessionRecord, session_id)
     if record is None or not record.recording_path:

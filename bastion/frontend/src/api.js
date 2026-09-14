@@ -26,3 +26,21 @@ export function wsUrl(path) {
   const token = encodeURIComponent(localStorage.getItem('token') || '')
   return `${proto}://${location.host}${path}?token=${token}`
 }
+
+// 本地解析 JWT payload（仅用于前端显隐控制，真正的权限校验在后端）
+export function jwtPayload() {
+  const token = localStorage.getItem('token')
+  if (!token) return null
+  try {
+    const part = token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/')
+    return JSON.parse(decodeURIComponent(
+      atob(part).split('').map((c) => `%${c.charCodeAt(0).toString(16).padStart(2, '0')}`).join(''),
+    ))
+  } catch {
+    return null
+  }
+}
+
+export function isAdmin() {
+  return !!jwtPayload()?.is_admin
+}

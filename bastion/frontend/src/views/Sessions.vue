@@ -24,7 +24,7 @@
         <thead>
           <tr>
             <th>会话 ID</th><th>用户</th><th>协议</th><th>目标资产</th><th>状态</th>
-            <th>来源 IP</th><th>开始时间</th><th>结束时间</th><th style="width:170px"></th>
+            <th>来源 IP</th><th>开始时间</th><th>结束时间</th><th style="width:300px"></th>
           </tr>
         </thead>
         <tbody>
@@ -47,6 +47,16 @@
                       :disabled="!canReplay(s)"
                       :title="replayHint(s)"
                       @click="openDetail(s, true)">▶ 回放</button>
+              <template v-if="s.status === 'active' &&
+                              (s.protocol === 'ssh' || s.protocol === 'rdp')">
+                <button class="btn ghost" style="margin-left:6px"
+                        @click="$router.push(`/observe/${s.id}`)">👁 旁观</button>
+                <button class="btn danger" style="margin-left:6px"
+                        :disabled="kickingId === s.id"
+                        @click="kick(s)">
+                  {{ kickingId === s.id ? '处理中…' : '强踢' }}
+                </button>
+              </template>
             </td>
           </tr>
           <tr v-if="!sessions.length"><td colspan="9" class="muted">暂无会话</td></tr>
@@ -142,6 +152,7 @@ const showPlayer = ref(false)
 const playerSessionId = ref('')
 const playerProtocol = ref('')
 const playerRef = ref(null)
+const kickingId = ref('')
 let pollTimer = null
 
 function fmt(t) {
@@ -149,7 +160,7 @@ function fmt(t) {
 }
 
 function eventLabel(t) {
-  return { login: '登录', command: '指令', close: '结束' }[t] || t
+  return { login: '登录', command: '指令', close: '结束', kick: '强踢' }[t] || t
 }
 
 function canReplay(s) {
@@ -219,6 +230,19 @@ function downloadCast() {
   })
 }
 
+async function kick(s) {
+  if (!confirm(`确定强制结束 ${s.user_name} 对「${s.asset_name}」的${s.protocol.toUpperCase()}会话？`)) return
+  kickingId.value = s.id
+  try {
+    await api.post(`/api/sessions/${s.id}/kick`)
+    await loadSessions()
+  } catch (e) {
+    alert(e.response?.data?.detail || '强踢失败')
+  } finally {
+    kickingId.value = ''
+  }
+}
+
 onMounted(() => {
   loadSessions()
   pollTimer = setInterval(loadSessions, 5000)
@@ -248,6 +272,7 @@ tr.current { background: rgba(56, 189, 248, .08); }
 .badge.command { color: #fcd34d; border-color: #92400e; }
 .badge.login { color: var(--ok); border-color: #065f46; }
 .badge.close { color: var(--muted); }
+.badge.kick { color: var(--danger); border-color: #7f1d1d; }
 .summary { color: var(--muted); font-size: 13px; word-break: break-word; }
 .btn-sm { padding: 4px 9px; font-size: 12px; }
 </style>

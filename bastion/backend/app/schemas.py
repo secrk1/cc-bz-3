@@ -65,3 +65,29 @@ class AuditOut(BaseModel):
     content: str | None
     response_summary: str | None = None
     created_at: datetime
+
+
+class TransferInitIn(BaseModel):
+    filename: str
+    path: str | None = None
+    size: int = Field(ge=0)
+
+
+class TransferOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    transfer_id: str
+    user_id: int
+    user_name: str = ""
+    asset_id: int
+    asset_name: str = ""
+    direction: str
+    filename: str
+    remote_path: str | None
+    size: int
+    bytes_done: int
+    md5: str | None
+    status: str
+    error: str | None
+    started_at: datetime
+    finished_at: datetime | None

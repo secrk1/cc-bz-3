@@ -96,13 +96,15 @@ class LineAuditor:
 async def run_ssh_session(websocket, *, asset, password: str | None,
                           session_id: str, cols: int, rows: int,
                           on_command, on_command_summary, on_close,
-                          recorder: AsyncCastRecorder | None) -> None:
+                          recorder: AsyncCastRecorder | None,
+                          relay=None) -> None:
     """建立并运行一个 SSH 交互式会话，直到断开。
 
     :param on_command:         异步回调 (cmd: str) -> int，回车提交时落审计，返回审计行 ID
     :param on_command_summary: 异步回调 (log_id: int, summary: str) -> None，响应静默后回写摘要
     :param on_close:           异步回调 () -> None，会话结束时收尾（含刷盘）
     :param recorder:           已打开的异步 asciicast 录像器
+    :param relay:              可选 LiveRelay，实时广播下行帧供管理员旁观
     """
     auditor = LineAuditor()
 
@@ -219,6 +221,9 @@ async def run_ssh_session(websocket, *, asset, password: str | None,
                 if recorder:
                     # 热路径：仅入队，worker 协程异步攒批写盘
                     recorder.record_output(text)
+                if relay:
+                    # 热路径：仅入队，worker 协程批量发布到 Redis
+                    relay.feed_output(chunk)
                 if capturing:
                     pending.append(text)
                     cancel_quiet_timer()
@@ -229,10 +234,14 @@ async def run_ssh_session(websocket, *, asset, password: str | None,
             asyncio.create_task(browser_to_ssh()),
             asyncio.create_task(ssh_to_browser()),
         }
-        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            # 强踢取消本协程时 CancelledError 会跳过常规收尾，
+            # 必须在此回收两个泵，避免它们继续写已关闭的 WebSocket
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
     except (asyncssh.Error, OSError) as exc:
         logger.warning("SSH 会话 %s 失败: %s", session_id, exc)
         try:

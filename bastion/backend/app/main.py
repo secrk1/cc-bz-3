@@ -5,9 +5,9 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import assets, auth, sessions, ws
+from app.api import assets, auth, observe, sessions, sftp, transfers, ws
 from app.config import settings
-from app.redis_client import redis_client
+from app.redis_client import redis_client, redis_client_bytes
 from app.services.recorder import ensure_recording_dir
 
 logging.basicConfig(level=logging.INFO,
@@ -20,6 +20,7 @@ async def lifespan(app: FastAPI):
     ensure_recording_dir(settings.recording_dir)
     yield
     await redis_client.aclose()
+    await redis_client_bytes.aclose()
 
 
 app = FastAPI(title="轻量堡垒机", version="1.0.0", lifespan=lifespan)
@@ -35,7 +36,11 @@ app.add_middleware(
 
 app.include_router(auth.router)
 app.include_router(assets.router)
+app.include_router(sftp.router)
+app.include_router(transfers.router)
+app.include_router(transfers.audit_router)
 app.include_router(sessions.router)
+app.include_router(observe.router)
 app.include_router(ws.router)
 
 

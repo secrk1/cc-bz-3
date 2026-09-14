@@ -2,7 +2,7 @@
   <AppLayout>
     <div class="toolbar">
       <h1 style="margin:0">资产主机</h1>
-      <button class="btn" @click="showCreate = true">+ 新增资产</button>
+      <button v-if="isAdmin" class="btn" @click="showCreate = true">+ 新增资产</button>
     </div>
 
     <div class="card">
@@ -24,7 +24,9 @@
                    rel="noopener" :href="`/terminal/${a.id}`">SSH 终端 ↗</a>
                 <a v-else class="btn" target="_blank"
                    rel="noopener" :href="`/desktop/${a.id}`">RDP 桌面 ↗</a>
-                <button class="btn ghost" style="margin-left:8px"
+                <a v-if="a.protocol === 'ssh'" class="btn ghost"
+                   style="margin-left:8px" :href="`/files/${a.id}`">📁 文件</a>
+                <button class="btn ghost" :style="a.protocol === 'ssh' ? 'margin-left:8px' : ''"
                         @click="check(a)" :disabled="checking[a.id]">
                   {{ checking[a.id] ? '探测中…' : '连通性' }}
                 </button>

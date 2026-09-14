@@ -8,6 +8,7 @@
 4. 进入对应代理桥；
 5. 结束时关闭录像器（排空落盘）、关闭会话、记录审计。
 """
+import asyncio
 import json
 import logging
 import os
@@ -29,6 +30,7 @@ from app.services.audit import (
     open_session,
     write_audit,
 )
+from app.services.live import LiveRelay, control_events
 from app.services.recorder import AsyncCastRecorder, ensure_recording_dir
 
 logger = logging.getLogger("ws")
@@ -68,6 +70,55 @@ async def _load_credential(asset: Asset) -> str | None:
     await redis_client.set(key, json.dumps({"password": password}),
                            ex=settings.credential_ttl)
     return password
+
+
+def watch_control(websocket: WebSocket, session_id: str, protocol: str,
+                  runner_task: asyncio.Task) -> asyncio.Task:
+    """监听强踢控制频道：收到 kick 时通知用户并终止会话任务。
+
+    close_session 收尾时会发 end，监听据此自行退出，避免孤儿任务。
+    """
+
+    async def _watch() -> None:
+        try:
+            async for command in control_events(session_id):
+                if command == "end":
+                    break
+                if command == "kick":
+                    logger.info("管理员强踢会话 %s", session_id)
+                    # 先终止会话任务（下行泵随之停止），再发通知，
+                    # 避免与转发循环并发写同一个 WebSocket
+                    runner_task.cancel()
+                    await asyncio.gather(runner_task,
+                                         return_exceptions=True)
+                    if protocol == "rdp":
+                        await _send_guac_error(websocket,
+                                               "会话已被管理员强制结束", 520)
+                    else:
+                        try:
+                            await websocket.send_text(
+                                "\r\n\x1b[31m[堡垒机] 会话已被管理员强制结束，"
+                                "连接即将关闭\x1b[0m\r\n")
+                        except Exception:  # noqa: BLE001
+                            pass
+                    break
+        except asyncio.CancelledError:
+            pass
+
+    return asyncio.create_task(_watch())
+
+
+async def _await_watcher(watcher: asyncio.Task) -> None:
+    """等待控制监听任务自然退出，确保强踢通知已发出后再关连接。
+
+    不能直接 cancel()：强踢时 watcher 需在会话任务结束后下发提示，
+    过早取消会导致用户端收不到任何提示、只表现为“卡住”。
+    """
+    try:
+        await asyncio.wait_for(watcher, timeout=3)
+    except asyncio.TimeoutError:
+        watcher.cancel()
+        await asyncio.gather(watcher, return_exceptions=True)
 
 
 @router.websocket("/ws/ssh/{asset_id}")
@@ -128,15 +179,25 @@ async def ws_ssh(
             await write_audit(db, session_id, "close", "会话结束")
             await close_session(db, session_id)
 
+        relay = await LiveRelay(session_id, "ssh").start()
+        runner = asyncio.create_task(run_ssh_session(
+            websocket, asset=asset, password=password, session_id=session_id,
+            cols=cols, rows=rows, on_command=on_command,
+            on_command_summary=on_command_summary, on_close=on_close,
+            recorder=recorder, relay=relay,
+        ))
+        watcher = watch_control(websocket, session_id, "ssh", runner)
         try:
-            await run_ssh_session(
-                websocket, asset=asset, password=password, session_id=session_id,
-                cols=cols, rows=rows, on_command=on_command,
-                on_command_summary=on_command_summary, on_close=on_close,
-                recorder=recorder,
-            )
+            await runner
+        except asyncio.CancelledError:
+            # 被强踢任务取消：等待会话自行收尾（on_close 在 finally 中执行）
+            await asyncio.gather(runner, return_exceptions=True)
         except WebSocketDisconnect:
             pass
+        finally:
+            # 限时等待 watcher 自然退出（强踢时其通知需在关连接前发出）
+            await _await_watcher(watcher)
+            await relay.aclose()
 
 
 @router.websocket("/ws/rdp/{asset_id}")
@@ -177,15 +238,25 @@ async def ws_rdp(
                            recording_path=recording_base)
         await write_audit(db, session_id, "login",
                           f"RDP 连接 {asset.host}:{asset.port}")
-        try:
+        relay = await LiveRelay(session_id, "rdp").start()
+
+        async def run_rdp() -> None:
             await guac.bridge(
                 websocket, guacd_host=settings.guacd_host,
                 guacd_port=settings.guacd_port, target_host=asset.host,
                 target_port=asset.port, username=asset.username,
                 password=password or "", width=width, height=height,
                 recording_path=settings.recording_dir,
-                recording_name=session_id,
+                recording_name=session_id, relay=relay,
             )
+
+        runner = asyncio.create_task(run_rdp())
+        watcher = watch_control(websocket, session_id, "rdp", runner)
+        try:
+            await runner
+        except asyncio.CancelledError:
+            # 强踢：等待 bridge 自行结束（finally 关闭到 guacd 的连接）
+            await asyncio.gather(runner, return_exceptions=True)
         except guac.GuacError as exc:
             logger.warning("RDP 握手失败 [%s] -> %s", asset.name, exc)
             await _send_guac_error(websocket, str(exc), exc.code)
@@ -193,8 +264,12 @@ async def ws_rdp(
             logger.warning("RDP 会话 %s 网络异常: %s", session_id, exc)
             await _send_guac_error(websocket, f"网关/目标网络异常：{exc}")
         finally:
+            # 先关闭会话（发布 end 让 watcher 自然退出），再等待其收尾，
+            # 否则正常关闭时 watcher 会一直等到超时
             await write_audit(db, session_id, "close", "RDP 会话结束")
             await close_session(db, session_id)
+            await _await_watcher(watcher)
+            await relay.aclose()
 
 
 @router.websocket("/ws/tcp/{asset_id}")

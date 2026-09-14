@@ -283,10 +283,12 @@ async def bridge(websocket, *, guacd_host: str, guacd_port: int,
                  password: str, width: int = DEFAULT_WIDTH,
                  height: int = DEFAULT_HEIGHT,
                  recording_path: str | None = None,
-                 recording_name: str | None = None) -> None:
+                 recording_name: str | None = None,
+                 relay=None) -> None:
     """建立到 guacd 的隧道并与给定 websocket 双向桥接，直到任一端关闭。
 
-    recording_path/name 非空时开启 guacd 原生图形录制（写指令流文件）。
+    recording_path/name 非空时开启 guacd 原生图形录制（写指令流文件）；
+    relay 非空时把下行 Guacamole 指令文本实时广播，供管理员旁观。
     """
     reader, writer = await asyncio.wait_for(
         asyncio.open_connection(guacd_host, guacd_port), timeout=5
@@ -321,35 +323,45 @@ async def bridge(websocket, *, guacd_host: str, guacd_port: int,
                         await writer.drain()
 
         pump_task = asyncio.create_task(ws_to_guacd())
-
-        # 3) 握手到 ready（此期间浏览器的 ping 由上面的泵送任务回显保活）
+        forward_task = None
         try:
-            await asyncio.wait_for(
-                _handshake(guac, writer, websocket, target_host=target_host,
-                           target_port=target_port, username=username,
-                           password=password, width=width, height=height,
-                           recording_path=recording_path,
-                           recording_name=recording_name),
-                timeout=HANDSHAKE_TIMEOUT,
-            )
-        except asyncio.TimeoutError:
-            raise GuacError(
-                f"RDP 握手超时（{HANDSHAKE_TIMEOUT}s）：目标 {target_host}:"
-                f"{target_port} 可达但未完成登录，请检查账号密码或目标桌面服务")
+            # 3) 握手到 ready（此期间浏览器的 ping 由上面的泵送任务回显保活）
+            try:
+                await asyncio.wait_for(
+                    _handshake(guac, writer, websocket, target_host=target_host,
+                               target_port=target_port, username=username,
+                               password=password, width=width, height=height,
+                               recording_path=recording_path,
+                               recording_name=recording_name),
+                    timeout=HANDSHAKE_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                raise GuacError(
+                    f"RDP 握手超时（{HANDSHAKE_TIMEOUT}s）：目标 {target_host}:"
+                    f"{target_port} 可达但未完成登录，请检查账号密码或目标桌面服务")
 
-        # 4) ready 后启动 guacd -> 浏览器 透传，与入站泵一同运行
-        async def guacd_to_ws() -> None:
-            while True:
-                op, args = await guac.read_instruction()
-                await websocket.send_text(
-                    _wrap(op, [a.decode("utf-8", "replace") for a in args]))
+            # 4) ready 后启动 guacd -> 浏览器 透传，与入站泵一同运行
+            async def guacd_to_ws() -> None:
+                while True:
+                    op, args = await guac.read_instruction()
+                    frame = _wrap(op, [a.decode("utf-8", "replace") for a in args])
+                    await websocket.send_text(frame)
+                    if relay is not None:
+                        # 热路径：仅入队，worker 批量发布 Redis（旁观所见即用户所得）
+                        relay.feed_output(frame.encode("utf-8"))
 
-        forward_task = asyncio.create_task(guacd_to_ws())
-        await asyncio.wait({pump_task, forward_task},
-                           return_when=asyncio.FIRST_COMPLETED)
-        for task in (pump_task, forward_task):
-            task.cancel()
-        await asyncio.gather(pump_task, forward_task, return_exceptions=True)
+            forward_task = asyncio.create_task(guacd_to_ws())
+            await asyncio.wait({pump_task, forward_task},
+                               return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            # 强踢取消本协程时 CancelledError 不经过 except Exception，
+            # 必须在此回收子泵，否则它们会继续向已关闭的 WebSocket 写帧
+            for task in (pump_task, forward_task):
+                if task is not None:
+                    task.cancel()
+            await asyncio.gather(
+                *[t for t in (pump_task, forward_task) if t is not None],
+                return_exceptions=True)
     except Exception as e:
         # 把错误以 error 指令形式透传给浏览器，避免静默断开
         try:

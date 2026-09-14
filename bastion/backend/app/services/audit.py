@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import AuditLog, SessionRecord
 from app.redis_client import redis_client, session_key
+from app.services.live import publish_control
 
 
 async def open_session(db: AsyncSession, *, session_id: str, user_id: int,
@@ -33,6 +34,8 @@ async def close_session(db: AsyncSession, session_id: str) -> None:
         record.ended_at = datetime.now(timezone.utc)
         await db.commit()
     await redis_client.delete(session_key(session_id))
+    # 通知在线旁观页：会话已结束（被强踢时观察者会先收到 kick）
+    await publish_control(session_id, "end")
 
 
 async def write_audit(db: AsyncSession, session_id: str, event_type: str,
